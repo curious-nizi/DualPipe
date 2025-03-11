@@ -64,7 +64,10 @@ def scatter(inputs, chunks, dim):
     if isinstance(inputs, torch.Tensor):
         inputs = (inputs,)
     assert all(x is None or isinstance(x, torch.Tensor) for x in inputs)
-    inputs = [chunk_tensor(x, chunks, dim) for x in inputs]
+    # suppose inputs = (tensor1, tensor2)
+    # inputs = [(tensor1_chunk1, tensor1_chunk2, tensor1_chunk3),(tensor2_chunk1, tensor2_chunk2, tensor2_chunk3)]
+    inputs = [chunk_tensor(x, chunks, dim) for x in inputs] 
+    # microbatches = [(tensor1_chunk1, tensor2_chunk1), (tensor1_chunk2, tensor2_chunk2), (tensor1_chunk3, tensor2_chunk3)]
     microbatches = [microbatch for microbatch in zip(*inputs)]
     if len(microbatches) == 0:
         microbatches = [() for _ in range(chunks)]

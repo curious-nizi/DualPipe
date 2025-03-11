@@ -24,13 +24,14 @@ class LinearFunc(torch.autograd.Function):
             weight.grad = torch.zeros_like(weight)
 
         def grad_weight_fn():
+            # dw = x.T @ dy
             weight.grad += grad_output.flatten(0, -2).T @ input.flatten(0, -2)
 
         if WeightGradStore.enabled:
             WeightGradStore.put(grad_weight_fn)
         else:
             grad_weight_fn()
-        grad_input = grad_output @ weight
+        grad_input = grad_output @ weight # dx = dy * w
         return grad_input, None
 
 
@@ -128,8 +129,8 @@ def main(rank, pp_size):
     full_modules = nn.Sequential(*[PipelineStage(hidden_size) for _ in range(pp_size)])
 
     # Full inputs
-    full_x = torch.randn(num_chunks * micro_batch_size, seq_len, hidden_size)
-    full_l = torch.randn(num_chunks * micro_batch_size, seq_len, hidden_size)
+    full_x = torch.randn(num_chunks * micro_batch_size, seq_len, hidden_size) # -> (20 * 3, 256, 512)
+    full_l = torch.randn(num_chunks * micro_batch_size, seq_len, hidden_size) # -> (20 * 3, 256, 512)
 
     # Reference step
     loss_ref, output_ref = ref_step(full_x, full_l, full_modules, num_chunks)
@@ -143,11 +144,11 @@ def main(rank, pp_size):
 
     # DualPipe inputs
     if is_first_rank:
-        x = full_x.chunk(2)[0]
-        l = full_l.chunk(2)[1]
+        x = full_x.chunk(2)[0] # first half of full_x (20 * 3, 256, 512) 
+        l = full_l.chunk(2)[1] # second half of full_l (20 * 3, 256, 512)
     elif is_last_rank:
-        x = full_x.chunk(2)[1]
-        l = full_l.chunk(2)[0]
+        x = full_x.chunk(2)[1] # second half of full_x (20 * 3, 256, 512)
+        l = full_l.chunk(2)[0] # first half of full_l (20 * 3, 256, 512)
     else:
         x = None
         l = None
@@ -198,5 +199,5 @@ def test_dualpipe(ngpus):
 
 if __name__ == "__main__":
     num_gpus = torch.cuda.device_count() // 2 * 2
-    for ngpus in range(num_gpus, 0, -2):
+    for ngpus in range(num_gpus, 0, -2): # range(4,0,-2) -> 4, 2
         test_dualpipe(ngpus)

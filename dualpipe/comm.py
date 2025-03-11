@@ -3,7 +3,8 @@ from typing import List, Tuple
 import torch
 import torch.distributed as dist
 
-
+# example of TENSOR_SHAPES: [(microbatch_size, seq_len, hidden_size)]
+# example of TENSOR_DTYPE: torch.float32
 TENSOR_SHAPES: List[Tuple[int]] = None
 TENSOR_DTYPE: torch.dtype = None
 
@@ -23,6 +24,7 @@ def build_from_tensor_shapes():
 
 
 def append_irecv(ops: List[dist.P2POp], src: int, group: dist.ProcessGroup) -> List[torch.Tensor]:
+    # allocate tensor memory
     tensors = build_from_tensor_shapes()
     src = dist.distributed_c10d.get_global_rank(group, src)
     for tensor in tensors:

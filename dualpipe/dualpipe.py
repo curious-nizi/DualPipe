@@ -28,26 +28,28 @@ class DualPipe(nn.Module):
         # rank_mapping: Map rank in process_group to actual pp rank.
         # rank_inverse_mapping: Map actual pp rank to rank in process_group.
         if rank_mapping is None:
-            rank_mapping = list(range(self.num_ranks))
-        rank_inverse_mapping = [None] * (self.num_ranks + 1)
+            rank_mapping = list(range(self.num_ranks)) # [0,1,2,3,4,5,6,7]
+        rank_inverse_mapping = [None] * (self.num_ranks + 1) # [None, None, None, None, None, None, None, None, None]
         for i in range(self.num_ranks):
-            rank_inverse_mapping[rank_mapping[i]] = i
+            rank_inverse_mapping[rank_mapping[i]] = i # [0,1,2,3,4,5,6,7,None], pp rank -> process rank
 
-        self.rank = rank_mapping[self.group.rank()]
-        self.first_rank = rank_inverse_mapping[0]
-        self.prev_rank = rank_inverse_mapping[self.rank - 1]
-        self.next_rank = rank_inverse_mapping[self.rank + 1]
-        self.last_rank = rank_inverse_mapping[self.num_ranks - 1]
+        self.rank = rank_mapping[self.group.rank()] # pp rank
+        self.first_rank = rank_inverse_mapping[0] # process rank of the first pp rank (0)
+        self.prev_rank = rank_inverse_mapping[self.rank - 1] # process rank of the previous pp rank
+        self.next_rank = rank_inverse_mapping[self.rank + 1] # process rank of the next pp rank
+        self.last_rank = rank_inverse_mapping[self.num_ranks - 1] # process rank of the last pp rank (7)
 
         self.is_first_rank = self.rank == 0
         self.is_last_rank = self.rank == self.num_ranks - 1
-        self.is_in_second_half = self.rank >= self.num_ranks // 2
-        self.is_middle_rank = (self.rank == self.num_ranks // 2 - 1) or (self.rank == self.num_ranks // 2)
+        self.is_in_second_half = self.rank >= self.num_ranks // 2 # rank = 4,5,6,7
+        self.is_middle_rank = (self.rank == self.num_ranks // 2 - 1) or (self.rank == self.num_ranks // 2) # rank = 3,4
 
     def _reset_states(self) -> None:
         WeightGradStore.clear()
 
+        # inputs are microbatches (numbered from 0 to num_chunks//2-1)
         self.input_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
+        # outputs are activations of each microbatch (numeberd from 0 to num_chunks//2-1)
         self.output_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
         self.input_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
         self.output_grad_chunks: Tuple[List[List[torch.Tensor]], List[List[torch.Tensor]]] = ([], [])
@@ -65,11 +67,15 @@ class DualPipe(nn.Module):
         self.to_free: List[torch.Tensor] = []
 
     def _forward_compute_chunk(self, phase: int) -> None:
+        # phase specifies which one of the dual pipelines to process
+        # the first half of ranks and the second half of ranks are like mirror images of each other
+        # phase = 0: the first half of ranks processes the first pipeline, the second half of ranks processes the second pipeline
+        # phase = 1: the first half of ranks processes the second pipeline, the second half of ranks processes the first pipeline
         phase ^= self.is_in_second_half
         chunk_id = self.current_f_chunk_id[phase]
         self.current_f_chunk_id[phase] += 1
         inputs = self.input_chunks[phase][chunk_id]
-        if self.forward_only:
+        if self.forward_only: # inference only
             self.input_chunks[phase][chunk_id] = None
 
         is_last_stage = (self.is_first_rank and phase == 1) or (self.is_last_rank and phase == 0)
@@ -187,7 +193,7 @@ class DualPipe(nn.Module):
             self._recv_forward(phase)
         self._commit_and_wait_comm()
 
-        self._forward_compute_chunk(phase)
+        self._forward_compute_chunk(phase) # forward pass
 
         if send:
             self._send_forward(phase)
@@ -235,6 +241,8 @@ class DualPipe(nn.Module):
             return
 
         self.current_recv_f_chunk_id[phase] += 1
+        # for the first pipeline (phase=0, top down), recv from the previous rank
+        # for the second pipeline (phase=1, bottom up), recv from the next rank
         tensors = comm.append_irecv(self.comm_ops, self.prev_rank if phase == 0 else self.next_rank, self.group)
         self.input_chunks[phase].append(tensors)
 
@@ -293,9 +301,13 @@ class DualPipe(nn.Module):
 
     def step(
         self,
+        # if i'm the first pp rank, inputs is the first half of the batch
+        # if i'm the last pp rank, inputs is the second half of the batch
         *inputs: Optional[torch.Tensor],
         num_chunks: int = 0,
         criterion: Optional[Callable] = None,
+        # if i'm the first pp rank, labels is the second half of the batch's labels
+        # if i'm the last pp rank, labels is the first half of the batch's labels
         labels: List[Optional[torch.Tensor]] = [],
         return_outputs: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[Union[torch.Tensor, Tuple[torch.Tensor]]]]:
@@ -322,26 +334,38 @@ class DualPipe(nn.Module):
                 Otherwise: ``None``.
 
         """
+        # need to know the shape of a microbatch (microbatch_size, seq_len, hidden_size)
         assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, \
             "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before doing a step."
         self.forward_only = not torch.is_grad_enabled()
         self.return_outputs = return_outputs
 
+        # suppose self.num_ranks = 8, self.rank = 1
         rank = self.rank
         num_ranks = self.num_ranks
         assert num_ranks % 2 == 0
         assert num_chunks > 0 and num_chunks % 2 == 0 and num_chunks >= num_ranks * 2, f"{num_chunks=}, {num_ranks=}"
-        num_half_ranks = num_ranks // 2
-        half_rank = min(rank, num_ranks - 1 - rank)
-        half_num_chunks = num_chunks // 2
-        self.num_half_ranks = num_half_ranks
+        num_half_ranks = num_ranks // 2 # num_half_ranks = 4
+        half_rank = min(rank, num_ranks - 1 - rank) # half_rank = min(1, 8-1-1) = min(1, 6) = 1
+        # rank:      0 1 2 3 4 5 6 7
+        # 7-rank:    7 6 5 4 3 2 1 0
+        # half_rank: 0 1 2 3 3 2 1 0
+        
+        # suppose num_chunks (microbatches) = 20
+        half_num_chunks = num_chunks // 2 # 10
+        self.num_half_ranks = num_half_ranks # 4
         self.half_rank = half_rank
 
         if not self.forward_only and (self.is_first_rank or self.is_last_rank):
-            assert criterion is not None
+            assert criterion is not None # loss function is required on the first/last ranks
 
         self._reset_states()
 
+        # self.batch_dim: the dimension along which to split the batch (default: 0)
+        # note: inputs is either the *first half* of the batch or the *second half* of the batch
+        # therefore, we only need to split inputs further by half_num_chunks.
+        # before scatter: inputs = (tensor1, tensor2)
+        # after scatter: inputs = [(tensor1_chunk1, tensor2_chunk1), , (tensor1_chunk10, tensor2_chunk10)]
         inputs = scatter(inputs, half_num_chunks, self.batch_dim)
         labels = scatter(labels, half_num_chunks, self.batch_dim)
         if self.is_first_rank:
@@ -356,22 +380,65 @@ class DualPipe(nn.Module):
         # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
 
         # Step 1: nF0
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_1:    6,4,2,0,0,2,4,6
         step_1 = (num_half_ranks - half_rank - 1) * 2
+        # device 0 (rank=0) processes forward pass of microbatch 0..5 of the first pipeline
+        # device 1 (rank=1) processes forward pass of microbatch 0..3
+        # device 2 (rank=2) processes forward pass of microbatch 0..1
+        # device 3 (rank=3) skip (step_1=0)
+        # device 4 (rank=4) skip (step_1=0)
+        # device 5 (rank=5) processes forward pass of microbatch 10..11
+        # device 6 (rank=6) processes forward pass of microbatch 10..13
+        # device 7 (rank=7) processes forward pass of microbatch 10..15
         for i in range(step_1):
             self._forward_chunk(0)
 
         # Step 2: nF0F1
         step_2 = half_rank + 1
+        
+        # *prepare* receiving outputs from previous ranks (allocate tensors and append receiving ops to self.comm_ops)
+        # rank 0: receive 6 (first rank, no op)
+        # rank 1: receive outputs for microbatch 4 from rank 0
+        # rank 2: receive outputs for microbatch 2 from rank 1
+        # rank 3: receive outputs for microbatch 0 from rank 2
+        # rank 4: receive outputs for microbatch 10 from rank 5
+        # rank 5: receive outputs for microbatch 12 from rank 6
+        # rank 6: receive outputs for microbatch 14 from rank 7
+        # rank 7: receive 16 (first rank, no op)
         self._recv_forward(0)
+        
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_2:    1,2,3,4,4,3,2,1 # step_2 = half_rank + 1
         for i in range(step_2):
+            # alternate processing the first and second pipeline
+            # rank 0: processes forward pass of microbatch 6,10
+            # rank 1: processes forward pass of microbatch 4,10,5,11
+            # rank 2: processes forward pass of microbatch 2,10,3,11,4,12
+            # rank 3: processes forward pass of microbatch 0,10,1,11,2,12,3,13
+            # rank 4: processes forward pass of microbatch 10,0,11,1,12,2,13,3
+            # rank 5: processes forward pass of microbatch 12,0,13,1,14,2
+            # rank 6: processes forward pass of microbatch 14,0,15,1
+            # rank 7: processes forward pass of microbatch 16,0
+            
+            # only rank 3 and 4 will send outputs to the next rank, others will wait to send at the end of this iteration
             self._forward_chunk(0, recv=False, send=self.is_middle_rank)
             self._recv_forward(0)
+           
+            # send outputs to next ranks except in the last iteration of rank 3 and 4 (middle rank)
             self._forward_chunk(1, send=(not self.is_middle_rank) or (i < step_2 - 1))
+            
+            # non-middle ranks send outputs from the prev _forward_chunk(0) to next ranks
             if not self.is_middle_rank:
                 self._send_forward(0)
-
+        
         # Step 3: nB1W1F1 (Use zero bubble)
         step_3 = num_half_ranks - half_rank - 1
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_3:    3,2,1,0,0,1,2,3 # step_3 = 4 - half_rank - 1 = 3 - half_rank
         for i in range(step_3):
             self._backward_chunk(1, enable_zb=True)
             self._recv_forward(1)
@@ -380,6 +447,10 @@ class DualPipe(nn.Module):
 
         # Step 4 (Main step): nF0B1F1B0
         step_4 = half_num_chunks - num_ranks + half_rank + 1
+        # half_num_chunks - num_ranks + 1 = 10 - 8 + 1 = 3
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_4:    3,4,5,6,6,5,4,3  # step_4 = 3 + half_rank
         for i in range(step_4):
             if i == 0:
                 if self.is_middle_rank:
