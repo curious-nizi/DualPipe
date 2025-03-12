@@ -403,14 +403,14 @@ class DualPipe(nn.Module):
         step_2 = half_rank + 1
         
         # *prepare* receiving outputs from previous ranks (allocate tensors and append receiving ops to self.comm_ops)
-        # rank 0: receive 6 (first rank, no op)
-        # rank 1: receive outputs for microbatch 4 from rank 0
-        # rank 2: receive outputs for microbatch 2 from rank 1
-        # rank 3: receive outputs for microbatch 0 from rank 2
-        # rank 4: receive outputs for microbatch 10 from rank 5
-        # rank 5: receive outputs for microbatch 12 from rank 6
-        # rank 6: receive outputs for microbatch 14 from rank 7
-        # rank 7: receive 16 (first rank, no op)
+        # rank 0: no op (first rank of the first pipeline)
+        # rank 1: receive fwd_4 from rank 0
+        # rank 2: receive fwd_2 from rank 1
+        # rank 3: receive fwd_0 from rank 2
+        # rank 4: receive fwd_10 from rank 5
+        # rank 5: receive fwd_12 from rank 6
+        # rank 6: receive fwd_14 from rank 7
+        # rank 7: no op (frist rank of the second pipeline)
         self._recv_forward(0)
         
         # rank:      0,1,2,3,4,5,6,7
@@ -490,13 +490,22 @@ class DualPipe(nn.Module):
             self._forward_backward_chunk(1, 0)
 
         # Step 5: nB1F1B0
+        # loop n times, each iteration processes bwd(1),fwd(1),bwd(0)
         step_5 = num_half_ranks - half_rank - 1
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_5:    3,2,1,0,0,1,2,3
         for i in range(step_5):
             self._backward_chunk(1)
             self._forward_backward_chunk(1, 0)
 
         # Step 6: nB1B0 (The second half of the chunks use zero bubble)
+        # loop n times, each iteration processes bwd(1),bwd(0)
         step_6 = half_rank + 1
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_6:    1,2,3,4,4,3,2,1
+        
         enable_zb = False
         for i in range(step_6):
             if i == step_6 // 2 and half_rank % 2 == 1:
@@ -507,13 +516,21 @@ class DualPipe(nn.Module):
             self._backward_chunk(0, enable_zb=enable_zb)
 
         # Step 7: nWB0 (Use zero bubble)
+        # loop n times, each iteration processes bwdw,bwd(0)
         step_7 = num_half_ranks - half_rank - 1
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_7:    3,2,1,0,0,1,2,3
         for i in range(step_7):
             self._weight_chunk()
             self._backward_chunk(0, enable_zb=True)
 
         # Step 8: nW
+        # loop n times, each iteration processes bwdw
         step_8 = half_rank + 1
+        # rank:      0,1,2,3,4,5,6,7
+        # half_rank: 0,1,2,3,3,2,1,0
+        # step_8:    1,2,3,4,4,3,2,1
         for i in range(step_8):
             self._weight_chunk()
         assert WeightGradStore.funcs_queue.empty()
