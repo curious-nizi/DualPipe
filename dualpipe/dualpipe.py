@@ -496,6 +496,14 @@ class DualPipe(nn.Module):
         # half_rank: 0,1,2,3,3,2,1,0
         # step_5:    3,2,1,0,0,1,2,3
         for i in range(step_5):
+            # rank0: processes bwd_16,fwd_17,bwd_3,bwd_17,fwd_18,bwd_4,bwd_18,fwd_19,bwd_5
+            # rank1: processes bwd_16,fwd_18,bwd_4,bwd_17,fwd_19,bwd_5
+            # rank2: processes bwd_16,fwd_19,bwd_5
+            # rank3: skip (step_5 = 0)
+            # rank4: skip (step_5 = 0)
+            # rank5: processes bwd_6,fwd_9,bwd_15
+            # rank6: processes bwd_6,fwd_8,bwd_14,bwd_7,fwd_9,bwd_15
+            # rank7: processes bwd_6,fwd_7,bwd_13,bwd_7,fwd_8,bwd_14,bwd_8,fwd_9,bwd_15
             self._backward_chunk(1)
             self._forward_backward_chunk(1, 0)
 
@@ -508,6 +516,15 @@ class DualPipe(nn.Module):
         
         enable_zb = False
         for i in range(step_6):
+            # rank0: processes bwd_19,bwdi_6
+            # rank1: processes bwd_18,bwd_6,bwdi_19,bwdi_7
+            # rank2: processes bwd_17,bwd_6,bwd_18,bwdi_7,bwdi_19,bwdi_8
+            # rank3: processes bwd_16,bwd_6,bwd_17,bwd_7,bwdi_18,bwdi_8,bwdi_19,bwdi_9
+            # rank4: processes bwd_6,bwd_16,bwd_7,bwd_17,bwdi_8,bwdi_18,bwdi_9,bwdi_19
+            # rank5: processes bwd_7,bwd_16,bwd_8,bwdi_17,bwdi_9,bwdi_18
+            # rank6: processes bwd_8,bwd_16,bwdi_9,bwdi_17
+            # rank7: processes bwd_9,bwdi_16
+            # the second half of the chunks use zero bubble
             if i == step_6 // 2 and half_rank % 2 == 1:
                 enable_zb = True
             self._backward_chunk(1, enable_zb=enable_zb)
@@ -522,6 +539,14 @@ class DualPipe(nn.Module):
         # half_rank: 0,1,2,3,3,2,1,0
         # step_7:    3,2,1,0,0,1,2,3
         for i in range(step_7):
+            # rank0: process bwdw_6,bwdi_7,bwdw_7,bwdi_8,bwdw_8,bwdi_9
+            # rank1: process bwdw_19,bwdi_8,bwdw_7,bwdi_9
+            # rank2: process bwdw_7,bwdi_9
+            # rank3: skip (step_7 = 0)
+            # rank4: skip (step_7 = 0)
+            # rank5: process bwdw_17,bwdi_19
+            # rank6: process bwdw_9,bwdi_18,bwdw_17,bwdi_19
+            # rank7: process bwdw_16,bwdi_17,bwdw_17,bwdi_18,bwdw_18,bwdi_19
             self._weight_chunk()
             self._backward_chunk(0, enable_zb=True)
 
@@ -532,6 +557,14 @@ class DualPipe(nn.Module):
         # half_rank: 0,1,2,3,3,2,1,0
         # step_8:    1,2,3,4,4,3,2,1
         for i in range(step_8):
+            # rank0: process bwdw_9
+            # rank1: process bwdw_8, bwdw_9
+            # rank2: process bwdw_19, bwdw_8, bwdw_9
+            # rank3: process bwdw_18, bwdw_8, bwdw_19, bwdw_9
+            # rank4: process bwdw_8, bwdw_18, bwdw_9, bwdw_19
+            # rank5: process bwdw_9, bwdw_18, bwdw_19
+            # rank6: process bwdw_18, bwdw_19
+            # rank7: process bwdw_19
             self._weight_chunk()
         assert WeightGradStore.funcs_queue.empty()
 
