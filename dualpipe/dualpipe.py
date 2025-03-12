@@ -380,22 +380,26 @@ class DualPipe(nn.Module):
         # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
 
         # Step 1: nF0
+        # loop n times, each iteration executes fwd(0)
+        # from the persective of the first half of the ranks, pipeline 0 is the first pipeline (top down)
+        # from the perspective of the second half of the ranks, pipeline 0 is the second pipeline (bottom up)
         # rank:      0,1,2,3,4,5,6,7
         # half_rank: 0,1,2,3,3,2,1,0
         # step_1:    6,4,2,0,0,2,4,6
         step_1 = (num_half_ranks - half_rank - 1) * 2
-        # device 0 (rank=0) processes forward pass of microbatch 0..5 of the first pipeline
-        # device 1 (rank=1) processes forward pass of microbatch 0..3
-        # device 2 (rank=2) processes forward pass of microbatch 0..1
+        # device 0 (rank=0) processes fwd_0 .. fwd_5
+        # device 1 (rank=1) processes fwd_0 .. fwd_3
+        # device 2 (rank=2) processes fwd_0 .. fwd_1
         # device 3 (rank=3) skip (step_1=0)
         # device 4 (rank=4) skip (step_1=0)
-        # device 5 (rank=5) processes forward pass of microbatch 10..11
-        # device 6 (rank=6) processes forward pass of microbatch 10..13
-        # device 7 (rank=7) processes forward pass of microbatch 10..15
+        # device 5 (rank=5) processes fwd_10 .. fwd_11
+        # device 6 (rank=6) processes fwd_10 .. fwd_13
+        # device 7 (rank=7) processes fwd_10 .. fwd_15
         for i in range(step_1):
             self._forward_chunk(0)
 
         # Step 2: nF0F1
+        # loop n times, each iteration executes fwd(0), fwd(1)
         step_2 = half_rank + 1
         
         # *prepare* receiving outputs from previous ranks (allocate tensors and append receiving ops to self.comm_ops)
@@ -414,17 +418,18 @@ class DualPipe(nn.Module):
         # step_2:    1,2,3,4,4,3,2,1 # step_2 = half_rank + 1
         for i in range(step_2):
             # alternate processing the first and second pipeline
-            # rank 0: processes forward pass of microbatch 6,10
-            # rank 1: processes forward pass of microbatch 4,10,5,11
-            # rank 2: processes forward pass of microbatch 2,10,3,11,4,12
-            # rank 3: processes forward pass of microbatch 0,10,1,11,2,12,3,13
-            # rank 4: processes forward pass of microbatch 10,0,11,1,12,2,13,3
-            # rank 5: processes forward pass of microbatch 12,0,13,1,14,2
-            # rank 6: processes forward pass of microbatch 14,0,15,1
-            # rank 7: processes forward pass of microbatch 16,0
+            # rank 0: processes fwd_6, fwd_10
+            # rank 1: processes fwd_4, fwd_10, fwd_5, fwd_11
+            # rank 2: processes fwd_2, fwd_10, fwd_3, fwd_11, fwd_4, fwd_12
+            # rank 3: processes fwd_0, fwd_10, fwd_1, fwd_11, fwd_2, fwd_12, fwd_3, fwd_13
+            # rank 4: processes fwd_10, fwd_0, fwd_11, fwd_1, fwd_12, fwd_2, fwd_13, fwd_3
+            # rank 5: processes fwd_12, fwd_0, fwd_13, fwd_1, fwd_14, fwd_2
+            # rank 6: processes fwd_14, fwd_0, fwd_15, fwd_1
+            # rank 7: processes fwd_16, fwd_0
             
             # only rank 3 and 4 will send outputs to the next rank, others will wait to send at the end of this iteration
             self._forward_chunk(0, recv=False, send=self.is_middle_rank)
+            # this recv is seperated out from _forward_chunk
             self._recv_forward(0)
            
             # send outputs to next ranks except in the last iteration of rank 3 and 4 (middle rank)
@@ -435,23 +440,41 @@ class DualPipe(nn.Module):
                 self._send_forward(0)
         
         # Step 3: nB1W1F1 (Use zero bubble)
+        # loop n times, each iteration execute bwdi(1),bwdw(1),fwd(1)
         step_3 = num_half_ranks - half_rank - 1
         # rank:      0,1,2,3,4,5,6,7
         # half_rank: 0,1,2,3,3,2,1,0
         # step_3:    3,2,1,0,0,1,2,3 # step_3 = 4 - half_rank - 1 = 3 - half_rank
         for i in range(step_3):
-            self._backward_chunk(1, enable_zb=True)
+            # rank0: processes bwdi_10,bwdw_10,fwd_11,bwdi_11,bwdw_11,fwd_12,bwdi_12,bwdw_12,fwd_13
+            # rank1: processes bwdi_10,bwdw_10,fwd_12,bwdi_11,bwdw_11,fwd_13
+            # rank2: processes bwdi_10,bwdw_10,fwd_13
+            # rank3: skip (step_3 = 0)
+            # rank4: skip (step_3 = 0)
+            # rank5: process bwdi_0,bwdw_0,fwd_4
+            # rank6: processes bwdi_0,bwdw_0,fwd_2,bwdi_1,bwdw_1,fwd_3
+            # rank7: processes bwdi_0,bwdw_0,fwd_1,bwdi_1,bwdw_1,fwd_2,bwdi_2,bwdw_2,fwd_3
+            self._backward_chunk(1, enable_zb=True) # enable zero bubble - decouple backward for inputs and backward for weights
             self._recv_forward(1)
             self._weight_chunk()
             self._forward_chunk(1, recv=False)
 
         # Step 4 (Main step): nF0B1F1B0
+        # loop n times, each iteration executes fwd(0),bwd(1),fwd(1),bwd(0)
         step_4 = half_num_chunks - num_ranks + half_rank + 1
         # half_num_chunks - num_ranks + 1 = 10 - 8 + 1 = 3
         # rank:      0,1,2,3,4,5,6,7
         # half_rank: 0,1,2,3,3,2,1,0
         # step_4:    3,4,5,6,6,5,4,3  # step_4 = 3 + half_rank
         for i in range(step_4):
+            # rank0: processes fwd_7,bwd_13,fwd_14,bwd_0,fwd_8,bwd_14,fwd_15,bwd_1,fwd_9,bwd_15,fwd_16,bwd_2
+            # rank1: processes fwd_6,bwd_12,fwd_14,bwd_0,fwd_7,bwd_13,fwd_15,bwd_1,fwd_8,bwd_14,fwd_16,bwd_2,fwd_9,bwd_15,fwd_17,bwd_3
+            # rank2: processes fwd_5,bwd_11,fwd_14,bwd_0,fwd_6,bwd_12,fwd_15,bwd_1,fwd_7,bwd_13,fwd_16,bwd_2,fwd_8,bwd_14,fwd_17,bwd_3,fwd_9,bwd_15,fwd_18,bwd_4
+            # rank3: processes fwd_4,bwd_10,fwd_14,bwd_0,fwd_5,bwd_11,fwd_15,bwd_1,fwd_6,bwd_12,fwd_16,bwd_2,fwd_7,bwd_13,fwd_17,bwd_3,fwd_8,bwd_14,fwd_18,bwd_4,fwd_9,bwd_15,fwd_19,bwd_5
+            # rank4: processes fwd_14,bwd_0,fwd_4,bwd_10,fwd_15,bwd_1,fwd_5,bwd_11,fwd_16,bwd_2,fwd_6,bwd_12,fwd_17,bwd_3,fwd_7,bwd_13,fwd_18,bwd_4,fwd_8,bwd_14,fwd_19,bwd_5,fwd_9,bwd_15
+            # rank5: processes fwd_15,bwd_1,fwd_4,bwd_10,fwd_16,bwd_2,fwd_5,bwd_11,fwd_17,bwd_3,fwd_6,bwd_12,fwd_18,bwd_4,fwd_7,bwd_13,fwd_19,bwd_5,fwd_8,bwd_14
+            # rank6: processes fwd_16,bwd_2,fwd_4,bwd_10,fwd_17,bwd_3,fwd_5,bwd_11,fwd_18,bwd_4,fwd_6,bwd_12,fwd_19,bwd_5,fwd_7,bwd_13
+            # rank7: processes fwd_17,bwd_3,fwd_4,bwd_10,fwd_18,bwd_4,fwd_5,bwd_11,fwd_19,bwd_5,fwd_6,bwd_12
             if i == 0:
                 if self.is_middle_rank:
                     # NOTE: We don't overlap these two chunks to further reduce bubble size.
